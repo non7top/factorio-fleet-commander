@@ -1,0 +1,14 @@
+{
+  "name": "fleet-commander",
+  "version": "1.0.0",
+  "title": "Fleet Commander",
+  "author": "Player",
+  "contact": "",
+  "homepage": "",
+  "description": "Automates space platform fleets using name and number matching. Ships sharing a text prefix (e.g. \"Cargo 1\", \"Cargo 2\") are grouped into a fleet; the platform numbered 1 is the Leader and its schedule, logistics requests, and physical build are automatically mirrored to every follower. New platforms are auto-named and auto-synced on creation. Runs entirely headless via event hooks.",
+  "factorio_version": "2.1",
+  "dependencies": [
+    "base >= 2.1.0",
+    "space-age"
+  ]
+}
