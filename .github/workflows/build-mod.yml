@@ -1,0 +1,96 @@
+name: Build mod package
+
+# Packages the mod into a Factorio-ready folder on every PR so reviewers
+# can download it and drop it straight into their `mods` folder. Uploaded
+# as a plain folder (not a zip) so GitHub's own artifact-download wrapping
+# is the only zip layer -- one extract, no nested zip. Named
+# "fleet-commander_<version>" using the exact version from info.json (no
+# PR/build suffix), so repeated downloads of the same version simply
+# overwrite the previous copy on disk.
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read mod name/version from info.json
+        id: meta
+        run: |
+          echo "name=$(jq -r .name info.json)" >> "$GITHUB_OUTPUT"
+          echo "version=$(jq -r .version info.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Assemble versioned mod folder
+        env:
+          FOLDER: ${{ steps.meta.outputs.name }}_${{ steps.meta.outputs.version }}
+        run: |
+          mkdir -p "build/$FOLDER"
+          # Only ship files Factorio actually needs to load the mod --
+          # skip repo scaffolding (README, LICENSE, plan notes, CI config).
+          cp -r info.json control.lua "build/$FOLDER/"
+          if [ -d locale ]; then cp -r locale "build/$FOLDER/"; fi
+          if [ -d graphics ]; then cp -r graphics "build/$FOLDER/"; fi
+
+      # GitHub always wraps an artifact in its own zip container on
+      # download, regardless of what we upload. Uploading an already-zipped
+      # file here would mean a *second*, nested zip -- the user has to
+      # unzip twice, and the outer file isn't a valid Factorio mod zip on
+      # its own. So we upload the plain mod folder instead: GitHub's
+      # wrapping is then the only zip layer.
+      #
+      # Point path at the *parent* ("build") rather than the versioned
+      # folder itself: upload-artifact uploads a given directory's
+      # contents at the artifact root, so pointing directly at the
+      # versioned folder would flatten it away, leaving loose files
+      # instead of a "fleet-commander_<version>" folder after extraction.
+      # Pointing at "build" preserves that folder as the single top-level
+      # entry in the extracted zip.
+      - name: Upload artifact
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.name }}_${{ steps.meta.outputs.version }}
+          path: build
+          if-no-files-found: error
+
+      - name: Comment PR with download link
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const name = "${{ steps.meta.outputs.name }}";
+            const version = "${{ steps.meta.outputs.version }}";
+            const runId = context.runId;
+            const artifactId = "${{ steps.upload.outputs.artifact-id }}";
+            const url = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${runId}/artifacts/${artifactId}`;
+            const marker = "<!-- fleet-commander-build-comment -->";
+            const body = `${marker}\n📦 Mod package built: **${name}_${version}**\n\n[Download the mod zip](${url})\n\nExtract it — you'll get a \`${name}_${version}\` folder — and drop that straight into your Factorio \`mods\` folder. Same version number, so it simply overwrites any previous copy.`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
