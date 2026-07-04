@@ -33,8 +33,8 @@ jobs:
           # Only ship files Factorio actually needs to load the mod --
           # skip repo scaffolding (README, LICENSE, plan notes, CI config).
           cp -r info.json control.lua "build/$FOLDER/"
-          [ -d locale ] && cp -r locale "build/$FOLDER/"
-          [ -d graphics ] && cp -r graphics "build/$FOLDER/"
+          if [ -d locale ]; then cp -r locale "build/$FOLDER/"; fi
+          if [ -d graphics ]; then cp -r graphics "build/$FOLDER/"; fi
 
       - name: Zip mod package
         env:
