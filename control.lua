@@ -20,7 +20,8 @@
 -- universe and can write a lot of state (schedule + requests + a
 -- blueprint stamp) per Follower, so we never want that bunched up or
 -- triggered from a high-frequency event. Instead:
---   * A single platform snapping into formation (on_space_platform_created)
+--   * A single platform snapping into formation (on_surface_created,
+--     used to detect a new platform -- see note below)
 --     or being caught red-handed (on_gui_closed) is synced immediately,
 --     but only that ONE platform is touched -- no fleet-wide scan.
 --   * Routine "did the Leader's stuff change" propagation is handled by
@@ -67,6 +68,10 @@ local function init_storage()
   -- a cursor into it. Rebuilt from scratch whenever it runs dry.
   storage.sync_queue = storage.sync_queue or {}
   storage.sync_queue_index = storage.sync_queue_index or 1
+
+  -- Dedupes the on_surface_created handler below so a platform is only
+  -- ever auto-named/onboarded once.
+  storage.known_platforms = storage.known_platforms or {}
 end
 
 script.on_init(init_storage)
@@ -391,9 +396,10 @@ end
 -- performance note at the top of this file.
 -- @param prefix string the fleet's text prefix
 -- @param leader LuaSpacePlatform the fleet's Leader platform
+-- @return boolean true if any Follower was actually changed
 local function sync_fleet(prefix, leader)
   if not leader or not leader.valid then
-    return
+    return false
   end
 
   local leader_schedule = capture_schedule(leader)
@@ -404,16 +410,29 @@ local function sync_fleet(prefix, leader)
   storage.leader_requests[prefix] = leader_requests
   storage.leader_blueprints[prefix] = leader_blueprint
 
+  local followers_changed = 0
   for_each_platform(function(platform)
     if platform ~= leader then
       local p_prefix, p_number = parse_platform_name(platform.name)
       if p_prefix == prefix and p_number and p_number > 1 then
-        sync_aspect(platform, leader_schedule, capture_schedule, apply_schedule)
-        sync_aspect(platform, leader_requests, capture_requests, apply_requests)
-        sync_aspect(platform, leader_blueprint, capture_blueprint, apply_blueprint)
+        local a = sync_aspect(platform, leader_schedule, capture_schedule, apply_schedule)
+        local b = sync_aspect(platform, leader_requests, capture_requests, apply_requests)
+        local c = sync_aspect(platform, leader_blueprint, capture_blueprint, apply_blueprint)
+        if a or b or c then
+          followers_changed = followers_changed + 1
+        end
       end
     end
   end)
+
+  if followers_changed > 0 then
+    log(string.format(
+      "[Fleet Commander] Synced fleet '%s' from leader '%s' to %d follower(s).",
+      prefix, leader.name, followers_changed
+    ))
+  end
+
+  return followers_changed > 0
 end
 
 --- Immediately brings ONE Follower into line, without scanning the rest
@@ -458,32 +477,53 @@ local function onboard_or_correct_follower(follower, leader, prefix)
 end
 
 -- ---------------------------------------------------------------------
--- Event Hook: on_space_platform_created
+-- Event Hook: on_surface_created (stands in for "platform created")
 -- ---------------------------------------------------------------------
--- Fires when a new platform starter hub is launched. We rename it into
--- the default fleet ("Cargo") using the next free number, then, if that
--- fleet already has a Leader (or a cached Leader snapshot), immediately
--- copy schedule/requests/blueprint over so the new ship joins already in
--- formation. Only this one platform is touched -- no fleet-wide scan.
+-- CRITICAL COMPATIBILITY FIX: there is no `defines.events.on_space_platform_created`
+-- in the real API -- that field is nil, and calling script.on_event(nil, ...)
+-- crashes the mod at load with "First argument must be a table or
+-- LuaEventType." Confirmed against https://lua-api.factorio.com/latest/events.html,
+-- which lists no space-platform-created event at all.
+--
+-- Every space platform does get its own dedicated surface at creation
+-- time though, and `LuaSurface.platform` (confirmed:
+-- https://lua-api.factorio.com/latest/classes/LuaSurface.html) resolves
+-- back to the owning LuaSpacePlatform. So we use on_surface_created as
+-- the "platform created" signal instead, filtering out every other kind
+-- of surface (planets, editor, etc.) this event also fires for.
+--
+-- storage.known_platforms dedupes so a given platform is only ever
+-- auto-named/onboarded once, even across saves/reloads.
 
-script.on_event(defines.events.on_space_platform_created, function(event)
-  local platform = event.platform
+script.on_event(defines.events.on_surface_created, function(event)
+  local surface = event.surface
+  local platform = surface and surface.valid and surface.platform
   if not platform or not platform.valid then
     return
   end
 
+  if storage.known_platforms[platform.index] then
+    return
+  end
+  storage.known_platforms[platform.index] = true
+
+  local old_name = platform.name
   local highest = find_highest_number(DEFAULT_FLEET_PREFIX)
   local new_number = highest + 1
   platform.name = DEFAULT_FLEET_PREFIX .. " " .. new_number
+  log("[Fleet Commander] New platform '" .. old_name .. "' named '" .. platform.name .. "'.")
 
   -- Empty Fleet Protection: if this is "Cargo 1" (no Leader existed
   -- before), there's nothing to sync to -- it simply becomes the Leader.
   if new_number == 1 then
+    log("[Fleet Commander] '" .. platform.name .. "' is the new fleet Leader.")
     return
   end
 
   local leader = find_leader(DEFAULT_FLEET_PREFIX)
-  onboard_or_correct_follower(platform, leader, DEFAULT_FLEET_PREFIX)
+  if onboard_or_correct_follower(platform, leader, DEFAULT_FLEET_PREFIX) then
+    log("[Fleet Commander] '" .. platform.name .. "' joined formation.")
+  end
   -- If there's no live Leader and no cached snapshot either, this is
   -- silently a no-op and the platform simply operates independently
   -- until a "Cargo 1" is built or renamed into place.
@@ -527,7 +567,9 @@ script.on_event(defines.events.on_gui_closed, function(event)
   if number == 1 then
     -- The Leader itself was edited: push the update to the whole fleet
     -- immediately.
-    sync_fleet(prefix, platform)
+    if sync_fleet(prefix, platform) then
+      log("[Fleet Commander] Leader '" .. platform.name .. "' edited via hub GUI; pushed to fleet.")
+    end
     return
   end
 
@@ -542,6 +584,7 @@ script.on_event(defines.events.on_gui_closed, function(event)
 
   local changed = onboard_or_correct_follower(platform, leader, prefix)
   if changed then
+    log("[Fleet Commander] Follower '" .. platform.name .. "' went off-script; reverted to match leader '" .. leader.name .. "'.")
     local player = game.get_player(event.player_index)
     if player then
       player.print(
