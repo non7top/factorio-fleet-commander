@@ -43,15 +43,21 @@ jobs:
       # file here would mean a *second*, nested zip -- the user has to
       # unzip twice, and the outer file isn't a valid Factorio mod zip on
       # its own. So we upload the plain mod folder instead: GitHub's
-      # wrapping is then the only zip layer, and a single extract produces
-      # exactly the "fleet-commander_<version>" folder ready to drop into
-      # `mods`.
+      # wrapping is then the only zip layer.
+      #
+      # Point path at the *parent* ("build") rather than the versioned
+      # folder itself: upload-artifact uploads a given directory's
+      # contents at the artifact root, so pointing directly at the
+      # versioned folder would flatten it away, leaving loose files
+      # instead of a "fleet-commander_<version>" folder after extraction.
+      # Pointing at "build" preserves that folder as the single top-level
+      # entry in the extracted zip.
       - name: Upload artifact
         id: upload
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.meta.outputs.name }}_${{ steps.meta.outputs.version }}
-          path: build/${{ steps.meta.outputs.name }}_${{ steps.meta.outputs.version }}
+          path: build
           if-no-files-found: error
 
       - name: Comment PR with download link
