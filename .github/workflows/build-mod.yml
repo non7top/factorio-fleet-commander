@@ -1,10 +1,12 @@
 name: Build mod package
 
-# Packages the mod into a Factorio-ready zip on every PR so reviewers can
-# download it and drop it straight into their `mods` folder. The zip's
-# internal folder is named "fleet-commander_<version>" using the exact
-# version from info.json (no PR/build suffix), so repeated downloads of
-# the same version simply overwrite the previous copy on disk.
+# Packages the mod into a Factorio-ready folder on every PR so reviewers
+# can download it and drop it straight into their `mods` folder. Uploaded
+# as a plain folder (not a zip) so GitHub's own artifact-download wrapping
+# is the only zip layer -- one extract, no nested zip. Named
+# "fleet-commander_<version>" using the exact version from info.json (no
+# PR/build suffix), so repeated downloads of the same version simply
+# overwrite the previous copy on disk.
 on:
   pull_request:
   workflow_dispatch:
@@ -36,23 +38,20 @@ jobs:
           if [ -d locale ]; then cp -r locale "build/$FOLDER/"; fi
           if [ -d graphics ]; then cp -r graphics "build/$FOLDER/"; fi
 
-      - name: Zip mod package
-        env:
-          FOLDER: ${{ steps.meta.outputs.name }}_${{ steps.meta.outputs.version }}
-        run: |
-          cd build
-          zip -r -9 "../$FOLDER.zip" "$FOLDER"
-
-      # The zip above is already compressed; ask upload-artifact not to
-      # re-compress it a second time when it wraps the artifact for
-      # download (compression-level 0 = store only).
+      # GitHub always wraps an artifact in its own zip container on
+      # download, regardless of what we upload. Uploading an already-zipped
+      # file here would mean a *second*, nested zip -- the user has to
+      # unzip twice, and the outer file isn't a valid Factorio mod zip on
+      # its own. So we upload the plain mod folder instead: GitHub's
+      # wrapping is then the only zip layer, and a single extract produces
+      # exactly the "fleet-commander_<version>" folder ready to drop into
+      # `mods`.
       - name: Upload artifact
         id: upload
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.meta.outputs.name }}_${{ steps.meta.outputs.version }}
-          path: ${{ steps.meta.outputs.name }}_${{ steps.meta.outputs.version }}.zip
-          compression-level: 0
+          path: build/${{ steps.meta.outputs.name }}_${{ steps.meta.outputs.version }}
           if-no-files-found: error
 
       - name: Comment PR with download link
@@ -66,7 +65,7 @@ jobs:
             const artifactId = "${{ steps.upload.outputs.artifact-id }}";
             const url = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${runId}/artifacts/${artifactId}`;
             const marker = "<!-- fleet-commander-build-comment -->";
-            const body = `${marker}\n📦 Mod package built: **${name}_${version}.zip**\n\n[Download the mod zip](${url})\n\nUnzip and drop the \`${name}_${version}\` folder straight into your Factorio \`mods\` folder — same version number, so it simply overwrites any previous copy.`;
+            const body = `${marker}\n📦 Mod package built: **${name}_${version}**\n\n[Download the mod zip](${url})\n\nExtract it — you'll get a \`${name}_${version}\` folder — and drop that straight into your Factorio \`mods\` folder. Same version number, so it simply overwrites any previous copy.`;
 
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
