@@ -14,16 +14,16 @@
 --   * The Leader's schedule, logistics requests, and physical build
 --     (captured as a blueprint) are mirrored onto every Follower.
 --   * Newly created platforms are auto-named into the default "Cargo"
---     fleet and immediately synced to that fleet's Leader, if one exists.
+--     fleet and synced to that fleet's Leader, if one exists.
 --
 -- PERFORMANCE DESIGN: a full fleet sync walks every platform in the
 -- universe and can write a lot of state (schedule + requests + a
 -- blueprint stamp) per Follower, so we never want that bunched up or
 -- triggered from a high-frequency event. Instead:
---   * A single platform snapping into formation (on_surface_created,
---     used to detect a new platform -- see note below)
---     or being caught red-handed (on_gui_closed) is synced immediately,
---     but only that ONE platform is touched -- no fleet-wide scan.
+--   * A brand-new platform is detected and onboarded within one second
+--     (see "New platform detection" below), and being caught red-handed
+--     editing a Follower (on_gui_closed) is corrected immediately -- but
+--     both only ever touch that ONE platform, no fleet-wide scan.
 --   * Routine "did the Leader's stuff change" propagation is handled by
 --     a round-robin scheduler: once per second we sync exactly ONE
 --     fleet's Leader -> Followers, then move on to the next fleet next
@@ -34,7 +34,7 @@
 local util = require("util")
 
 local DEFAULT_FLEET_PREFIX = "Cargo"
-local SYNC_TICK_INTERVAL = 60 -- once per second at 60 UPS
+local TICK_INTERVAL = 60 -- once per second at 60 UPS
 
 -- A generous fixed capture area for blueprinting a platform's build.
 -- CAVEAT: the runtime API has no documented getter for a space platform
@@ -49,33 +49,6 @@ local PLATFORM_CAPTURE_AREA = { { -128, -128 }, { 128, 128 } }
 -- defines.logistic_member_index.space_platform_hub_requester
 -- (https://lua-api.factorio.com/latest/defines.html#logistic_member_index).
 local HUB_REQUESTER_INDEX = defines.logistic_member_index.space_platform_hub_requester
-
--- ---------------------------------------------------------------------
--- Storage
--- ---------------------------------------------------------------------
-
---- Initializes persistent mod state. Safe to call multiple times.
-local function init_storage()
-  -- Cache of each fleet's last-known Leader schedule/requests/blueprint,
-  -- keyed by prefix. This lets a Follower snap into formation even if
-  -- the Leader isn't reachable at that exact moment (see Empty Fleet
-  -- Protection below).
-  storage.leader_schedules = storage.leader_schedules or {}
-  storage.leader_requests = storage.leader_requests or {}
-  storage.leader_blueprints = storage.leader_blueprints or {}
-
-  -- Round-robin queue of fleet prefixes for the periodic sync below, plus
-  -- a cursor into it. Rebuilt from scratch whenever it runs dry.
-  storage.sync_queue = storage.sync_queue or {}
-  storage.sync_queue_index = storage.sync_queue_index or 1
-
-  -- Dedupes the on_surface_created handler below so a platform is only
-  -- ever auto-named/onboarded once.
-  storage.known_platforms = storage.known_platforms or {}
-end
-
-script.on_init(init_storage)
-script.on_configuration_changed(init_storage)
 
 -- ---------------------------------------------------------------------
 -- Name parsing
@@ -149,6 +122,44 @@ local function find_highest_number(prefix)
   end)
   return highest
 end
+
+-- ---------------------------------------------------------------------
+-- Storage
+-- ---------------------------------------------------------------------
+
+--- Initializes persistent mod state. Safe to call multiple times.
+local function init_storage()
+  -- Cache of each fleet's last-known Leader schedule/requests/blueprint,
+  -- keyed by prefix. This lets a Follower snap into formation even if
+  -- the Leader isn't reachable at that exact moment (see Empty Fleet
+  -- Protection below).
+  storage.leader_schedules = storage.leader_schedules or {}
+  storage.leader_requests = storage.leader_requests or {}
+  storage.leader_blueprints = storage.leader_blueprints or {}
+
+  -- Round-robin queue of fleet prefixes for the periodic sync below, plus
+  -- a cursor into it. Rebuilt from scratch whenever it runs dry.
+  storage.sync_queue = storage.sync_queue or {}
+  storage.sync_queue_index = storage.sync_queue_index or 1
+
+  -- Tracks which platforms this mod has already seen, so the periodic
+  -- new-platform scan below only onboards each platform once.
+  local first_time = storage.known_platforms == nil
+  storage.known_platforms = storage.known_platforms or {}
+  if first_time then
+    -- Anything that already exists the first time this mod runs (e.g.
+    -- it was added to an existing save) is left exactly as-is -- only
+    -- platforms created AFTER this point get auto-named/onboarded. This
+    -- avoids surprise mass-renames of a fleet the player already set up
+    -- by hand before installing the mod.
+    for_each_platform(function(platform)
+      storage.known_platforms[platform.index] = true
+    end)
+  end
+end
+
+script.on_init(init_storage)
+script.on_configuration_changed(init_storage)
 
 --- Generic deep structural equality check via JSON round-trip, used to
 -- avoid pointless re-applies (and re-triggering follow-on logic) when a
@@ -477,57 +488,58 @@ local function onboard_or_correct_follower(follower, leader, prefix)
 end
 
 -- ---------------------------------------------------------------------
--- Event Hook: on_surface_created (stands in for "platform created")
+-- New platform detection
 -- ---------------------------------------------------------------------
--- CRITICAL COMPATIBILITY FIX: there is no `defines.events.on_space_platform_created`
--- in the real API -- that field is nil, and calling script.on_event(nil, ...)
--- crashes the mod at load with "First argument must be a table or
--- LuaEventType." Confirmed against https://lua-api.factorio.com/latest/events.html,
--- which lists no space-platform-created event at all.
+-- CRITICAL COMPATIBILITY NOTE: there is no dedicated "platform created"
+-- event. `defines.events.on_space_platform_created` does not exist in
+-- the real API (confirmed against
+-- https://lua-api.factorio.com/latest/events.html) -- registering it
+-- crashes the mod at load since the field is nil. An earlier version of
+-- this mod tried `on_surface_created` + `LuaSurface.platform` as a
+-- substitute, but that did not reliably onboard new platforms in
+-- testing (most likely `.platform` isn't populated yet at the exact
+-- moment that event fires during platform construction).
 --
--- Every space platform does get its own dedicated surface at creation
--- time though, and `LuaSurface.platform` (confirmed:
--- https://lua-api.factorio.com/latest/classes/LuaSurface.html) resolves
--- back to the owning LuaSpacePlatform. So we use on_surface_created as
--- the "platform created" signal instead, filtering out every other kind
--- of surface (planets, editor, etc.) this event also fires for.
---
--- storage.known_platforms dedupes so a given platform is only ever
--- auto-named/onboarded once, even across saves/reloads.
+-- Instead, new platforms are detected by a plain scan: every second, as
+-- part of the round-robin tick below, we check every live platform
+-- against storage.known_platforms and onboard any we haven't seen
+-- before. This trades instant reaction (on creation) for reliability --
+-- a new platform is named/synced within one second, guaranteed, instead
+-- of depending on a specific event firing at a specific point in an
+-- undocumented internal sequence.
 
-script.on_event(defines.events.on_surface_created, function(event)
-  local surface = event.surface
-  local platform = surface and surface.valid and surface.platform
-  if not platform or not platform.valid then
-    return
-  end
+--- Scans all platforms for ones this mod hasn't seen yet, auto-names
+-- them into the default fleet, and onboards them onto that fleet's
+-- Leader (or the last cached Leader snapshot) if one exists.
+local function detect_new_platforms()
+  for_each_platform(function(platform)
+    if not storage.known_platforms[platform.index] then
+      storage.known_platforms[platform.index] = true
 
-  if storage.known_platforms[platform.index] then
-    return
-  end
-  storage.known_platforms[platform.index] = true
+      local old_name = platform.name
+      local highest = find_highest_number(DEFAULT_FLEET_PREFIX)
+      local new_number = highest + 1
+      platform.name = DEFAULT_FLEET_PREFIX .. " " .. new_number
+      log("[Fleet Commander] New platform '" .. tostring(old_name) .. "' named '" .. platform.name .. "'.")
 
-  local old_name = platform.name
-  local highest = find_highest_number(DEFAULT_FLEET_PREFIX)
-  local new_number = highest + 1
-  platform.name = DEFAULT_FLEET_PREFIX .. " " .. new_number
-  log("[Fleet Commander] New platform '" .. old_name .. "' named '" .. platform.name .. "'.")
-
-  -- Empty Fleet Protection: if this is "Cargo 1" (no Leader existed
-  -- before), there's nothing to sync to -- it simply becomes the Leader.
-  if new_number == 1 then
-    log("[Fleet Commander] '" .. platform.name .. "' is the new fleet Leader.")
-    return
-  end
-
-  local leader = find_leader(DEFAULT_FLEET_PREFIX)
-  if onboard_or_correct_follower(platform, leader, DEFAULT_FLEET_PREFIX) then
-    log("[Fleet Commander] '" .. platform.name .. "' joined formation.")
-  end
-  -- If there's no live Leader and no cached snapshot either, this is
-  -- silently a no-op and the platform simply operates independently
-  -- until a "Cargo 1" is built or renamed into place.
-end)
+      -- Empty Fleet Protection: if this is "Cargo 1" (no Leader existed
+      -- before), there's nothing to sync to -- it simply becomes the
+      -- Leader.
+      if new_number == 1 then
+        log("[Fleet Commander] '" .. platform.name .. "' is the new fleet Leader.")
+      else
+        local leader = find_leader(DEFAULT_FLEET_PREFIX)
+        if onboard_or_correct_follower(platform, leader, DEFAULT_FLEET_PREFIX) then
+          log("[Fleet Commander] '" .. platform.name .. "' joined formation.")
+        end
+        -- If there's no live Leader and no cached snapshot either, this
+        -- is silently a no-op and the platform simply operates
+        -- independently until a "Cargo 1" is built or renamed into
+        -- place.
+      end
+    end
+  end)
+end
 
 -- ---------------------------------------------------------------------
 -- Anti-Breakaway Logic: on_gui_closed
@@ -596,14 +608,18 @@ script.on_event(defines.events.on_gui_closed, function(event)
 end)
 
 -- ---------------------------------------------------------------------
--- Round-robin periodic fleet sync (safety net + routine propagation)
+-- Round-robin periodic tick (new-platform detection + fleet sync)
 -- ---------------------------------------------------------------------
--- Fires once per second. Each firing advances a rotating queue of fleet
--- prefixes by exactly one and fully syncs only that one fleet -- so with
--- N fleets, each fleet is refreshed roughly every N seconds, but no
--- single tick ever pays for more than one fleet's worth of writes. This
--- also acts as the safety net for edits the on_gui_closed hook can't see
--- (remote-view schedule editing, console commands, other mods).
+-- Fires once per second. Each firing:
+--   1. Scans for and onboards any brand-new platforms (cheap: just name
+--      parsing plus, at most, one onboarding write for genuinely new
+--      platforms -- see detect_new_platforms above).
+--   2. Advances a rotating queue of fleet prefixes by exactly one and
+--      fully syncs only that one fleet -- so with N fleets, each fleet
+--      is refreshed roughly every N seconds, but no single tick ever
+--      pays for more than one fleet's worth of writes. This also acts
+--      as the safety net for edits the on_gui_closed hook can't see
+--      (remote-view schedule editing, console commands, other mods).
 
 --- Rebuilds the round-robin queue with the current set of distinct
 -- prefixes that have a live Leader right now. Cheap: just name parsing,
@@ -622,7 +638,9 @@ local function rebuild_sync_queue()
   storage.sync_queue_index = 1
 end
 
-script.on_nth_tick(SYNC_TICK_INTERVAL, function()
+script.on_nth_tick(TICK_INTERVAL, function()
+  detect_new_platforms()
+
   if storage.sync_queue_index > #storage.sync_queue then
     rebuild_sync_queue()
   end
