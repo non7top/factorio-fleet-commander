@@ -161,6 +161,15 @@ end
 script.on_init(init_storage)
 script.on_configuration_changed(init_storage)
 
+-- Always-fire diagnostic: confirms the mod's script is actually loaded
+-- and running every time a save is loaded (on_init only fires once, the
+-- very first time a save with this mod is created). If this line never
+-- shows up in factorio-current.log, the mod isn't loading at all --
+-- check the mod list / errors on startup, not this file's logic.
+script.on_load(function()
+  log("[Fleet Commander] Mod loaded.")
+end)
+
 --- Generic deep structural equality check via JSON round-trip, used to
 -- avoid pointless re-applies (and re-triggering follow-on logic) when a
 -- captured snapshot hasn't actually changed.
@@ -570,6 +579,11 @@ script.on_event(defines.events.on_gui_closed, function(event)
   if not platform or not platform.valid then
     return
   end
+
+  -- Always-fire diagnostic: confirms the hook itself is running every
+  -- time you close the hub GUI, independent of whether the name matches
+  -- the fleet naming convention or anything ends up needing a sync.
+  log("[Fleet Commander] Hub GUI closed for '" .. platform.name .. "'.")
 
   local prefix, number = parse_platform_name(platform.name)
   if not prefix then
